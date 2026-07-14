@@ -1,0 +1,752 @@
+{
+  "datasets": [
+    {
+      "name": "warehouses",
+      "displayName": "warehouses",
+      "queryLines": [
+        "WITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END,0.95)/1000.0,1) AS p95_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id\n  HAVING queued_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth, CAST(ROUND(approx_percentile(depth,0.95)) AS INT) AS p95_depth FROM run GROUP BY wid)\nSELECT a.warehouse_id, a.total_queries, a.queued_queries, a.pct_queued,\n  a.avg_queue_s, a.p95_queue_s, a.max_queue_s, ROUND(a.max_queue_s/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.p95_depth,0) AS p95_depth,\n  CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS clusters_to_add,\n  CASE WHEN a.p95_queue_s<10 THEN '1. <10s' WHEN a.p95_queue_s<30 THEN '2. 10-30s'\n       WHEN a.p95_queue_s<60 THEN '3. 30-60s' WHEN a.p95_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a LEFT JOIN dep d ON d.wid = a.warehouse_id"
+      ]
+    },
+    {
+      "name": "daily",
+      "displayName": "daily",
+      "queryLines": [
+        "SELECT date(start_time) AS day,\n  SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END) AS queued_queries,\n  ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s\nFROM system.query.history\nWHERE compute.type='WAREHOUSE' AND start_time >= current_date() - INTERVAL 30 DAYS\nGROUP BY date(start_time) ORDER BY day"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "overview",
+      "displayName": "Overview — current UX",
+      "layout": [
+        {
+          "widget": {
+            "name": "t_title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# 📊 DBSQL Queue Breaker — are your SQL warehouses making users wait?\n",
+                "This dashboard reads **your own** `system.query.history` and finds SQL warehouses where queries **queue at capacity** — i.e. the warehouse hit its max-cluster ceiling and made queries wait before they even started running. That's avoidable latency your users feel on every dashboard and query.\n",
+                "**The fix is usually a ~2-minute, reversible change:** raise the warehouse's *max clusters* (autoscaling limit), or size it up. Page 2 lists exactly which warehouses and how many clusters to add. _Trailing 30 days. Read-only. No data leaves your workspace._"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "k_wh",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "k_wh_v",
+                      "expression": "COUNT(`warehouse_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "k_wh_v",
+                  "displayName": "Warehouses queuing"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Warehouses queuing"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "k_avg",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "k_avg_v",
+                      "expression": "ROUND(AVG(`avg_queue_s`),1)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "k_avg_v",
+                  "displayName": "Avg queue wait (s)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Avg queue wait (s)"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 3,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "k_queued",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "k_queued_v",
+                      "expression": "SUM(`queued_queries`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "k_queued_v",
+                  "displayName": "Queries queued (30d)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Queries queued (30d)"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 3,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "k_worst",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "k_worst_v",
+                      "expression": "ROUND(MAX(`max_queue_min`),1)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "k_worst_v",
+                  "displayName": "Worst wait (min)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Worst wait (min)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "k_5min",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "k_5min_v",
+                      "expression": "SUM(CASE WHEN `p95_queue_s`>=300 THEN 1 ELSE 0 END)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "k_5min_v",
+                  "displayName": "Warehouses p95 ≥ 5 min"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Warehouses p95 ≥ 5 min"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 5,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "k_add",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "k_add_v",
+                      "expression": "SUM(`clusters_to_add`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "k_add_v",
+                  "displayName": "Clusters to add (total)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Clusters to add (total)"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 5,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "l_qpd",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "daily",
+                  "fields": [
+                    {
+                      "name": "day",
+                      "expression": "`day`"
+                    },
+                    {
+                      "name": "queued_queries",
+                      "expression": "`queued_queries`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "day",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Day"
+                },
+                "y": {
+                  "fieldName": "queued_queries",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Queued queries"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Queued queries per day"
+              },
+              "mark": {
+                "colors": [
+                  "#FF3621",
+                  "#FFAB00",
+                  "#00A972",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#919191",
+                  "#1B3139",
+                  "#5A67D8",
+                  "#E17055"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 7,
+            "width": 3,
+            "height": 4
+          }
+        },
+        {
+          "widget": {
+            "name": "l_wpd",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "daily",
+                  "fields": [
+                    {
+                      "name": "day",
+                      "expression": "`day`"
+                    },
+                    {
+                      "name": "avg_queue_s",
+                      "expression": "`avg_queue_s`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "day",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Day"
+                },
+                "y": {
+                  "fieldName": "avg_queue_s",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Avg wait (s)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Average queue wait per day (s)"
+              },
+              "mark": {
+                "colors": [
+                  "#FF3621",
+                  "#FFAB00",
+                  "#00A972",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#919191",
+                  "#1B3139",
+                  "#5A67D8",
+                  "#E17055"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 7,
+            "width": 3,
+            "height": 4
+          }
+        },
+        {
+          "widget": {
+            "name": "b_bucket",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "wait_bucket",
+                      "expression": "`wait_bucket`"
+                    },
+                    {
+                      "name": "cnt",
+                      "expression": "COUNT(`warehouse_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "wait_bucket",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "natural-order"
+                    }
+                  },
+                  "displayName": "p95 wait"
+                },
+                "y": {
+                  "fieldName": "cnt",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Warehouses"
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Warehouses by wait severity (p95)"
+              },
+              "mark": {
+                "colors": [
+                  "#FF3621",
+                  "#FFAB00",
+                  "#00A972",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#919191",
+                  "#1B3139",
+                  "#5A67D8",
+                  "#E17055"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 11,
+            "width": 3,
+            "height": 4
+          }
+        },
+        {
+          "widget": {
+            "name": "sc",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "p95_queue_s",
+                      "expression": "`p95_queue_s`"
+                    },
+                    {
+                      "name": "clusters_to_add",
+                      "expression": "`clusters_to_add`"
+                    },
+                    {
+                      "name": "wait_bucket",
+                      "expression": "`wait_bucket`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "scatter",
+              "encodings": {
+                "x": {
+                  "fieldName": "p95_queue_s",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "p95 queue wait (s)"
+                },
+                "y": {
+                  "fieldName": "clusters_to_add",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Clusters to add"
+                },
+                "color": {
+                  "fieldName": "wait_bucket",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Wait severity"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Where to act: wait vs. clusters to add"
+              },
+              "mark": {
+                "colors": [
+                  "#FF3621",
+                  "#FFAB00",
+                  "#00A972",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#919191",
+                  "#1B3139",
+                  "#5A67D8",
+                  "#E17055"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 11,
+            "width": 3,
+            "height": 4
+          }
+        }
+      ]
+    },
+    {
+      "name": "drill",
+      "displayName": "Warehouses to scale up",
+      "layout": [
+        {
+          "widget": {
+            "name": "t_drill",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Warehouses to scale up\n",
+                "Ranked by **Clusters to add**. `Add clusters` = raise the warehouse's max scaling limit by this many (≈ 1 cluster per 10 concurrently-queued queries). A tiny warehouse with a big number is a **size-up** conversation (bump the t-shirt size), not just more clusters. Warehouse shown by **ID** — find it under SQL Warehouses. Confirm in the warehouse monitoring page before changing settings."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "tbl",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "warehouse_id",
+                      "expression": "`warehouse_id`"
+                    },
+                    {
+                      "name": "clusters_to_add",
+                      "expression": "`clusters_to_add`"
+                    },
+                    {
+                      "name": "p95_depth",
+                      "expression": "`p95_depth`"
+                    },
+                    {
+                      "name": "avg_queue_s",
+                      "expression": "`avg_queue_s`"
+                    },
+                    {
+                      "name": "p95_queue_s",
+                      "expression": "`p95_queue_s`"
+                    },
+                    {
+                      "name": "max_queue_min",
+                      "expression": "`max_queue_min`"
+                    },
+                    {
+                      "name": "pct_queued",
+                      "expression": "`pct_queued`"
+                    },
+                    {
+                      "name": "queued_queries",
+                      "expression": "`queued_queries`"
+                    },
+                    {
+                      "name": "queue_days",
+                      "expression": "`queue_days`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "warehouse_id",
+                    "displayName": "Warehouse ID",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "type": "string",
+                    "displayAs": "string"
+                  },
+                  {
+                    "fieldName": "clusters_to_add",
+                    "displayName": "Add clusters",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "type": "string",
+                    "displayAs": "string"
+                  },
+                  {
+                    "fieldName": "p95_depth",
+                    "displayName": "Peak-ish queued (p95)",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "type": "string",
+                    "displayAs": "string"
+                  },
+                  {
+                    "fieldName": "avg_queue_s",
+                    "displayName": "Avg wait (s)",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "type": "string",
+                    "displayAs": "string"
+                  },
+                  {
+                    "fieldName": "p95_queue_s",
+                    "displayName": "p95 wait (s)",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "type": "string",
+                    "displayAs": "string"
+                  },
+                  {
+                    "fieldName": "max_queue_min",
+                    "displayName": "Max wait (min)",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "type": "string",
+                    "displayAs": "string"
+                  },
+                  {
+                    "fieldName": "pct_queued",
+                    "displayName": "% queued",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "type": "string",
+                    "displayAs": "string"
+                  },
+                  {
+                    "fieldName": "queued_queries",
+                    "displayName": "Queued qrs (30d)",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "type": "string",
+                    "displayAs": "string"
+                  },
+                  {
+                    "fieldName": "queue_days",
+                    "displayName": "Queue days",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "type": "string",
+                    "displayAs": "string"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "All queuing warehouses (scale-up candidates)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 6,
+            "height": 12
+          }
+        }
+      ]
+    }
+  ]
+}
