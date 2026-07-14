@@ -4,21 +4,52 @@
       "name": "warehouses",
       "displayName": "warehouses",
       "queryLines": [
-        "WITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END,0.95)/1000.0,1) AS p95_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id\n  HAVING queued_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth, CAST(ROUND(approx_percentile(depth,0.95)) AS INT) AS p95_depth FROM run GROUP BY wid)\nSELECT a.warehouse_id, a.total_queries, a.queued_queries, a.pct_queued,\n  a.avg_queue_s, a.p95_queue_s, a.max_queue_s, ROUND(a.max_queue_s/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.p95_depth,0) AS p95_depth,\n  CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS clusters_to_add,\n  CASE WHEN a.p95_queue_s<10 THEN '1. <10s' WHEN a.p95_queue_s<30 THEN '2. 10-30s'\n       WHEN a.p95_queue_s<60 THEN '3. 30-60s' WHEN a.p95_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a LEFT JOIN dep d ON d.wid = a.warehouse_id"
+        "WITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id, workspace_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END,0.95)/1000.0,1) AS p95_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days,\n    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) AS spill_queries,\n    ROUND(AVG(CASE WHEN spilled_local_bytes>0 THEN spilled_local_bytes END)/1e9,2) AS avg_spill_gb\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id, workspace_id\n  HAVING queued_queries > 0 OR spill_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth, CAST(ROUND(approx_percentile(depth,0.95)) AS INT) AS p95_depth FROM run GROUP BY wid),\nwhcfg AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters FROM (\n    SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters,\n      ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n    FROM system.compute.warehouses WHERE delete_time IS NULL\n  ) WHERE rn=1\n),\nwsn AS (SELECT CAST(workspace_id AS STRING) wid, MAX(workspace_name) AS workspace_name\n        FROM system.access.workspaces_latest GROUP BY CAST(workspace_id AS STRING))\nSELECT a.warehouse_id, a.workspace_id, wsn.workspace_name, wc.warehouse_name,\n  concat_ws(' · ', initcap(lower(replace(wc.warehouse_size,'_',' '))), initcap(lower(wc.warehouse_type))) AS wh_config,\n  CASE\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 AND a.spill_queries*10 >= a.total_queries THEN 'Add clusters + size up'\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 THEN 'Add clusters'\n    WHEN a.spill_queries*10 >= a.total_queries THEN 'Size up'\n    ELSE 'Monitor'\n  END AS recommended_action,\n  CASE wc.warehouse_size\n    WHEN '2X_SMALL' THEN 'X-Small' WHEN 'X_SMALL' THEN 'Small' WHEN 'SMALL' THEN 'Medium'\n    WHEN 'MEDIUM' THEN 'Large' WHEN 'LARGE' THEN 'X-Large' WHEN 'X_LARGE' THEN '2X-Large'\n    WHEN '2X_LARGE' THEN '3X-Large' WHEN '3X_LARGE' THEN '4X-Large' WHEN '4X_LARGE' THEN '4X-Large (already max)'\n    ELSE NULL END AS recommended_size,\n  wc.min_clusters, wc.max_clusters,\n  CASE WHEN wc.max_clusters > wc.min_clusters THEN 'Yes' ELSE 'No' END AS autoscaling,\n  wc.max_clusters + CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS recommended_max,\n  CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS clusters_to_add,\n  a.spill_queries, ROUND(100.0*a.spill_queries/a.total_queries,1) AS pct_spill, COALESCE(a.avg_spill_gb,0) AS avg_spill_gb,\n  a.total_queries, a.queued_queries, a.pct_queued,\n  COALESCE(a.avg_queue_s,0) AS avg_queue_s, COALESCE(a.p95_queue_s,0) AS p95_queue_s,\n  COALESCE(a.max_queue_s,0) AS max_queue_s, ROUND(COALESCE(a.max_queue_s,0)/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.p95_depth,0) AS p95_depth,\n  CASE WHEN COALESCE(a.p95_queue_s,0)>=60 THEN 1 ELSE 0 END AS is_1min,\n  CASE WHEN COALESCE(a.p95_queue_s,0)<10 THEN '1. <10s' WHEN a.p95_queue_s<30 THEN '2. 10-30s'\n       WHEN a.p95_queue_s<60 THEN '3. 30-60s' WHEN a.p95_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a\nLEFT JOIN dep d ON d.wid = a.warehouse_id\nLEFT JOIN whcfg wc ON wc.warehouse_id = a.warehouse_id\nLEFT JOIN wsn ON wsn.wid = CAST(a.workspace_id AS STRING)"
       ]
     },
     {
       "name": "daily",
       "displayName": "daily",
       "queryLines": [
-        "SELECT date(start_time) AS day,\n  SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END) AS queued_queries,\n  ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s\nFROM system.query.history\nWHERE compute.type='WAREHOUSE' AND start_time >= current_date() - INTERVAL 30 DAYS\nGROUP BY date(start_time) ORDER BY day"
+        "SELECT date(start_time) AS day,\n  SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END) AS queued_queries\nFROM system.query.history\nWHERE compute.type='WAREHOUSE' AND start_time >= current_date() - INTERVAL 30 DAYS\nGROUP BY date(start_time)"
+      ]
+    },
+    {
+      "name": "kpi",
+      "displayName": "kpi",
+      "queryLines": [
+        "SELECT SUM(CASE WHEN p95_queue_s >= CAST(:min_wait_sec AS DOUBLE) THEN 1 ELSE 0 END) AS wh_over,\n  SUM(clusters_to_add) AS clusters_to_add\nFROM (\nWITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id, workspace_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END,0.95)/1000.0,1) AS p95_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days,\n    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) AS spill_queries,\n    ROUND(AVG(CASE WHEN spilled_local_bytes>0 THEN spilled_local_bytes END)/1e9,2) AS avg_spill_gb\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id, workspace_id\n  HAVING queued_queries > 0 OR spill_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth, CAST(ROUND(approx_percentile(depth,0.95)) AS INT) AS p95_depth FROM run GROUP BY wid),\nwhcfg AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters FROM (\n    SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters,\n      ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n    FROM system.compute.warehouses WHERE delete_time IS NULL\n  ) WHERE rn=1\n),\nwsn AS (SELECT CAST(workspace_id AS STRING) wid, MAX(workspace_name) AS workspace_name\n        FROM system.access.workspaces_latest GROUP BY CAST(workspace_id AS STRING))\nSELECT a.warehouse_id, a.workspace_id, wsn.workspace_name, wc.warehouse_name,\n  concat_ws(' · ', initcap(lower(replace(wc.warehouse_size,'_',' '))), initcap(lower(wc.warehouse_type))) AS wh_config,\n  CASE\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 AND a.spill_queries*10 >= a.total_queries THEN 'Add clusters + size up'\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 THEN 'Add clusters'\n    WHEN a.spill_queries*10 >= a.total_queries THEN 'Size up'\n    ELSE 'Monitor'\n  END AS recommended_action,\n  CASE wc.warehouse_size\n    WHEN '2X_SMALL' THEN 'X-Small' WHEN 'X_SMALL' THEN 'Small' WHEN 'SMALL' THEN 'Medium'\n    WHEN 'MEDIUM' THEN 'Large' WHEN 'LARGE' THEN 'X-Large' WHEN 'X_LARGE' THEN '2X-Large'\n    WHEN '2X_LARGE' THEN '3X-Large' WHEN '3X_LARGE' THEN '4X-Large' WHEN '4X_LARGE' THEN '4X-Large (already max)'\n    ELSE NULL END AS recommended_size,\n  wc.min_clusters, wc.max_clusters,\n  CASE WHEN wc.max_clusters > wc.min_clusters THEN 'Yes' ELSE 'No' END AS autoscaling,\n  wc.max_clusters + CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS recommended_max,\n  CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS clusters_to_add,\n  a.spill_queries, ROUND(100.0*a.spill_queries/a.total_queries,1) AS pct_spill, COALESCE(a.avg_spill_gb,0) AS avg_spill_gb,\n  a.total_queries, a.queued_queries, a.pct_queued,\n  COALESCE(a.avg_queue_s,0) AS avg_queue_s, COALESCE(a.p95_queue_s,0) AS p95_queue_s,\n  COALESCE(a.max_queue_s,0) AS max_queue_s, ROUND(COALESCE(a.max_queue_s,0)/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.p95_depth,0) AS p95_depth,\n  CASE WHEN COALESCE(a.p95_queue_s,0)>=60 THEN 1 ELSE 0 END AS is_1min,\n  CASE WHEN COALESCE(a.p95_queue_s,0)<10 THEN '1. <10s' WHEN a.p95_queue_s<30 THEN '2. 10-30s'\n       WHEN a.p95_queue_s<60 THEN '3. 30-60s' WHEN a.p95_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a\nLEFT JOIN dep d ON d.wid = a.warehouse_id\nLEFT JOIN whcfg wc ON wc.warehouse_id = a.warehouse_id\nLEFT JOIN wsn ON wsn.wid = CAST(a.workspace_id AS STRING)\n)"
+      ],
+      "parameters": [
+        {
+          "displayName": "p95 wait threshold (sec)",
+          "keyword": "min_wait_sec",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "60"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "spill",
+      "displayName": "spill",
+      "queryLines": [
+        "SELECT workspace_id, workspace_name, warehouse_id, warehouse_name, wh_config, recommended_size,\n  spill_queries, pct_spill, avg_spill_gb, total_queries\nFROM (\nWITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id, workspace_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END,0.95)/1000.0,1) AS p95_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days,\n    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) AS spill_queries,\n    ROUND(AVG(CASE WHEN spilled_local_bytes>0 THEN spilled_local_bytes END)/1e9,2) AS avg_spill_gb\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id, workspace_id\n  HAVING queued_queries > 0 OR spill_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth, CAST(ROUND(approx_percentile(depth,0.95)) AS INT) AS p95_depth FROM run GROUP BY wid),\nwhcfg AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters FROM (\n    SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters,\n      ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n    FROM system.compute.warehouses WHERE delete_time IS NULL\n  ) WHERE rn=1\n),\nwsn AS (SELECT CAST(workspace_id AS STRING) wid, MAX(workspace_name) AS workspace_name\n        FROM system.access.workspaces_latest GROUP BY CAST(workspace_id AS STRING))\nSELECT a.warehouse_id, a.workspace_id, wsn.workspace_name, wc.warehouse_name,\n  concat_ws(' · ', initcap(lower(replace(wc.warehouse_size,'_',' '))), initcap(lower(wc.warehouse_type))) AS wh_config,\n  CASE\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 AND a.spill_queries*10 >= a.total_queries THEN 'Add clusters + size up'\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 THEN 'Add clusters'\n    WHEN a.spill_queries*10 >= a.total_queries THEN 'Size up'\n    ELSE 'Monitor'\n  END AS recommended_action,\n  CASE wc.warehouse_size\n    WHEN '2X_SMALL' THEN 'X-Small' WHEN 'X_SMALL' THEN 'Small' WHEN 'SMALL' THEN 'Medium'\n    WHEN 'MEDIUM' THEN 'Large' WHEN 'LARGE' THEN 'X-Large' WHEN 'X_LARGE' THEN '2X-Large'\n    WHEN '2X_LARGE' THEN '3X-Large' WHEN '3X_LARGE' THEN '4X-Large' WHEN '4X_LARGE' THEN '4X-Large (already max)'\n    ELSE NULL END AS recommended_size,\n  wc.min_clusters, wc.max_clusters,\n  CASE WHEN wc.max_clusters > wc.min_clusters THEN 'Yes' ELSE 'No' END AS autoscaling,\n  wc.max_clusters + CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS recommended_max,\n  CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS clusters_to_add,\n  a.spill_queries, ROUND(100.0*a.spill_queries/a.total_queries,1) AS pct_spill, COALESCE(a.avg_spill_gb,0) AS avg_spill_gb,\n  a.total_queries, a.queued_queries, a.pct_queued,\n  COALESCE(a.avg_queue_s,0) AS avg_queue_s, COALESCE(a.p95_queue_s,0) AS p95_queue_s,\n  COALESCE(a.max_queue_s,0) AS max_queue_s, ROUND(COALESCE(a.max_queue_s,0)/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.p95_depth,0) AS p95_depth,\n  CASE WHEN COALESCE(a.p95_queue_s,0)>=60 THEN 1 ELSE 0 END AS is_1min,\n  CASE WHEN COALESCE(a.p95_queue_s,0)<10 THEN '1. <10s' WHEN a.p95_queue_s<30 THEN '2. 10-30s'\n       WHEN a.p95_queue_s<60 THEN '3. 30-60s' WHEN a.p95_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a\nLEFT JOIN dep d ON d.wid = a.warehouse_id\nLEFT JOIN whcfg wc ON wc.warehouse_id = a.warehouse_id\nLEFT JOIN wsn ON wsn.wid = CAST(a.workspace_id AS STRING)\n) WHERE spill_queries > 0"
       ]
     }
   ],
   "pages": [
     {
-      "name": "overview",
-      "displayName": "Overview — current UX",
+      "name": "main",
+      "displayName": "DBSQL Queue Breaker",
       "layout": [
         {
           "widget": {
@@ -26,8 +57,7 @@
             "multilineTextboxSpec": {
               "lines": [
                 "# 📊 DBSQL Queue Breaker — are your SQL warehouses making users wait?\n",
-                "This dashboard reads **your own** `system.query.history` and finds SQL warehouses where queries **queue at capacity** — i.e. the warehouse hit its max-cluster ceiling and made queries wait before they even started running. That's avoidable latency your users feel on every dashboard and query.\n",
-                "**The fix is usually a ~2-minute, reversible change:** raise the warehouse's *max clusters* (autoscaling limit), or size it up. Page 2 lists exactly which warehouses and how many clusters to add. _Trailing 30 days. Read-only. No data leaves your workspace._"
+                "Reads your workspace's `system.query.history` and finds warehouses that need more headroom, and **which lever** to pull: **Add clusters** (queries queuing at capacity → raise max clusters) or **Size up** (queries spilling to disk → bigger t-shirt size). The **table** gives a per-warehouse recommended action. Filter by **Workspace**. _Trailing 30 days · read-only · nothing leaves your workspace._"
               ]
             }
           },
@@ -35,21 +65,34 @@
             "x": 0,
             "y": 0,
             "width": 6,
-            "height": 3
+            "height": 2
           }
         },
         {
           "widget": {
-            "name": "k_wh",
+            "name": "f_ws",
             "queries": [
               {
-                "name": "main_query",
+                "name": "f_ws_warehouses",
                 "query": {
                   "datasetName": "warehouses",
                   "fields": [
                     {
-                      "name": "k_wh_v",
-                      "expression": "COUNT(`warehouse_id`)"
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ws_spill",
+                "query": {
+                  "datasetName": "spill",
+                  "fields": [
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
                     }
                   ],
                   "disaggregated": false
@@ -58,38 +101,46 @@
             ],
             "spec": {
               "version": 2,
-              "widgetType": "counter",
+              "widgetType": "filter-multi-select",
               "encodings": {
-                "value": {
-                  "fieldName": "k_wh_v",
-                  "displayName": "Warehouses queuing"
-                }
+                "fields": [
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID",
+                    "queryName": "f_ws_warehouses"
+                  },
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID",
+                    "queryName": "f_ws_spill"
+                  }
+                ]
               },
               "frame": {
                 "showTitle": true,
-                "title": "Warehouses queuing"
+                "title": "Workspace"
               }
             }
           },
           "position": {
             "x": 0,
-            "y": 3,
+            "y": 2,
             "width": 2,
             "height": 2
           }
         },
         {
           "widget": {
-            "name": "k_avg",
+            "name": "k_over",
             "queries": [
               {
                 "name": "main_query",
                 "query": {
-                  "datasetName": "warehouses",
+                  "datasetName": "kpi",
                   "fields": [
                     {
-                      "name": "k_avg_v",
-                      "expression": "ROUND(AVG(`avg_queue_s`),1)"
+                      "name": "wh_over",
+                      "expression": "`wh_over`"
                     }
                   ],
                   "disaggregated": false
@@ -101,115 +152,36 @@
               "widgetType": "counter",
               "encodings": {
                 "value": {
-                  "fieldName": "k_avg_v",
-                  "displayName": "Avg queue wait (s)"
+                  "fieldName": "wh_over",
+                  "aggregation": "SUM",
+                  "displayName": "Warehouses over p95 threshold"
                 }
               },
               "frame": {
                 "showTitle": true,
-                "title": "Avg queue wait (s)"
-              }
-            }
-          },
-          "position": {
-            "x": 2,
-            "y": 3,
-            "width": 2,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "k_queued",
-            "queries": [
-              {
-                "name": "main_query",
-                "query": {
-                  "datasetName": "warehouses",
-                  "fields": [
-                    {
-                      "name": "k_queued_v",
-                      "expression": "SUM(`queued_queries`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "counter",
-              "encodings": {
-                "value": {
-                  "fieldName": "k_queued_v",
-                  "displayName": "Queries queued (30d)"
-                }
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Queries queued (30d)"
-              }
-            }
-          },
-          "position": {
-            "x": 4,
-            "y": 3,
-            "width": 2,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "k_worst",
-            "queries": [
-              {
-                "name": "main_query",
-                "query": {
-                  "datasetName": "warehouses",
-                  "fields": [
-                    {
-                      "name": "k_worst_v",
-                      "expression": "ROUND(MAX(`max_queue_min`),1)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "counter",
-              "encodings": {
-                "value": {
-                  "fieldName": "k_worst_v",
-                  "displayName": "Worst wait (min)"
-                }
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Worst wait (min)"
+                "title": "Warehouses over p95 threshold"
               }
             }
           },
           "position": {
             "x": 0,
-            "y": 5,
+            "y": 4,
             "width": 2,
             "height": 2
           }
         },
         {
           "widget": {
-            "name": "k_5min",
+            "name": "p_thresh",
             "queries": [
               {
-                "name": "main_query",
+                "name": "p_thresh_q",
                 "query": {
-                  "datasetName": "warehouses",
-                  "fields": [
+                  "datasetName": "kpi",
+                  "parameters": [
                     {
-                      "name": "k_5min_v",
-                      "expression": "SUM(CASE WHEN `p95_queue_s`>=300 THEN 1 ELSE 0 END)"
+                      "name": "min_wait_sec",
+                      "keyword": "min_wait_sec"
                     }
                   ],
                   "disaggregated": false
@@ -218,62 +190,40 @@
             ],
             "spec": {
               "version": 2,
-              "widgetType": "counter",
+              "widgetType": "filter-single-select",
               "encodings": {
-                "value": {
-                  "fieldName": "k_5min_v",
-                  "displayName": "Warehouses p95 ≥ 5 min"
-                }
+                "fields": [
+                  {
+                    "parameterName": "min_wait_sec",
+                    "queryName": "p_thresh_q"
+                  }
+                ]
               },
               "frame": {
                 "showTitle": true,
-                "title": "Warehouses p95 ≥ 5 min"
+                "title": "p95 wait threshold (sec)"
               }
             }
           },
           "position": {
             "x": 2,
-            "y": 5,
+            "y": 4,
             "width": 2,
             "height": 2
           }
         },
         {
           "widget": {
-            "name": "k_add",
-            "queries": [
-              {
-                "name": "main_query",
-                "query": {
-                  "datasetName": "warehouses",
-                  "fields": [
-                    {
-                      "name": "k_add_v",
-                      "expression": "SUM(`clusters_to_add`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "counter",
-              "encodings": {
-                "value": {
-                  "fieldName": "k_add_v",
-                  "displayName": "Clusters to add (total)"
-                }
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Clusters to add (total)"
-              }
+            "name": "t_setmsg",
+            "multilineTextboxSpec": {
+              "lines": [
+                "**⚠️ Please set the p95 wait threshold (seconds)** in the box to the left — the *Warehouses over p95 threshold* count = warehouses whose p95 queue wait is ≥ that many seconds."
+              ]
             }
           },
           "position": {
             "x": 4,
-            "y": 5,
+            "y": 4,
             "width": 2,
             "height": 2
           }
@@ -321,7 +271,7 @@
               },
               "frame": {
                 "showTitle": true,
-                "title": "Queued queries per day"
+                "title": "Queued queries per day (total)"
               },
               "mark": {
                 "colors": [
@@ -340,75 +290,8 @@
           },
           "position": {
             "x": 0,
-            "y": 7,
-            "width": 3,
-            "height": 4
-          }
-        },
-        {
-          "widget": {
-            "name": "l_wpd",
-            "queries": [
-              {
-                "name": "main_query",
-                "query": {
-                  "datasetName": "daily",
-                  "fields": [
-                    {
-                      "name": "day",
-                      "expression": "`day`"
-                    },
-                    {
-                      "name": "avg_queue_s",
-                      "expression": "`avg_queue_s`"
-                    }
-                  ],
-                  "disaggregated": true
-                }
-              }
-            ],
-            "spec": {
-              "version": 3,
-              "widgetType": "line",
-              "encodings": {
-                "x": {
-                  "fieldName": "day",
-                  "scale": {
-                    "type": "temporal"
-                  },
-                  "displayName": "Day"
-                },
-                "y": {
-                  "fieldName": "avg_queue_s",
-                  "scale": {
-                    "type": "quantitative"
-                  },
-                  "displayName": "Avg wait (s)"
-                }
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Average queue wait per day (s)"
-              },
-              "mark": {
-                "colors": [
-                  "#FF3621",
-                  "#FFAB00",
-                  "#00A972",
-                  "#8BCAE7",
-                  "#AB4057",
-                  "#919191",
-                  "#1B3139",
-                  "#5A67D8",
-                  "#E17055"
-                ]
-              }
-            }
-          },
-          "position": {
-            "x": 3,
-            "y": 7,
-            "width": 3,
+            "y": 6,
+            "width": 6,
             "height": 4
           }
         },
@@ -480,7 +363,80 @@
           },
           "position": {
             "x": 0,
-            "y": 11,
+            "y": 10,
+            "width": 3,
+            "height": 4
+          }
+        },
+        {
+          "widget": {
+            "name": "b_action",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "warehouses",
+                  "fields": [
+                    {
+                      "name": "recommended_action",
+                      "expression": "`recommended_action`"
+                    },
+                    {
+                      "name": "cnt",
+                      "expression": "COUNT(`warehouse_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "recommended_action",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "natural-order"
+                    }
+                  },
+                  "displayName": "action"
+                },
+                "y": {
+                  "fieldName": "cnt",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Warehouses"
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Warehouses by recommended action"
+              },
+              "mark": {
+                "colors": [
+                  "#FF3621",
+                  "#FFAB00",
+                  "#00A972",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#919191",
+                  "#1B3139",
+                  "#5A67D8",
+                  "#E17055"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 10,
             "width": 3,
             "height": 4
           }
@@ -503,8 +459,8 @@
                       "expression": "`clusters_to_add`"
                     },
                     {
-                      "name": "wait_bucket",
-                      "expression": "`wait_bucket`"
+                      "name": "recommended_action",
+                      "expression": "`recommended_action`"
                     }
                   ],
                   "disaggregated": true
@@ -530,16 +486,16 @@
                   "displayName": "Clusters to add"
                 },
                 "color": {
-                  "fieldName": "wait_bucket",
+                  "fieldName": "recommended_action",
                   "scale": {
                     "type": "categorical"
                   },
-                  "displayName": "Wait severity"
+                  "displayName": "Action"
                 }
               },
               "frame": {
                 "showTitle": true,
-                "title": "Where to act: wait vs. clusters to add"
+                "title": "Where to act: wait vs. clusters to add (colored by action)"
               },
               "mark": {
                 "colors": [
@@ -557,31 +513,25 @@
             }
           },
           "position": {
-            "x": 3,
-            "y": 11,
-            "width": 3,
-            "height": 4
+            "x": 0,
+            "y": 14,
+            "width": 6,
+            "height": 5
           }
-        }
-      ]
-    },
-    {
-      "name": "drill",
-      "displayName": "Warehouses to scale up",
-      "layout": [
+        },
         {
           "widget": {
-            "name": "t_drill",
+            "name": "t_tbl",
             "multilineTextboxSpec": {
               "lines": [
-                "# Warehouses to scale up\n",
-                "Ranked by **Clusters to add**. `Add clusters` = raise the warehouse's max scaling limit by this many (≈ 1 cluster per 10 concurrently-queued queries). A tiny warehouse with a big number is a **size-up** conversation (bump the t-shirt size), not just more clusters. Warehouse shown by **ID** — find it under SQL Warehouses. Confirm in the warehouse monitoring page before changing settings."
+                "## Warehouses to scale up\n",
+                "**Recommended action** — *Add clusters* = queries queue at capacity (raise the max scaling limit, ≈1 cluster per 10 concurrently-queued queries). *Size up* = queries spill to disk (out of memory → bump the t-shirt size). *Add clusters + size up* = both. Spill/queue thresholds are heuristics — confirm in the warehouse monitoring page before changing settings. Warehouse shown by **ID** (find it under SQL Warehouses)."
               ]
             }
           },
           "position": {
             "x": 0,
-            "y": 0,
+            "y": 19,
             "width": 6,
             "height": 2
           }
@@ -596,8 +546,36 @@
                   "datasetName": "warehouses",
                   "fields": [
                     {
-                      "name": "warehouse_id",
-                      "expression": "`warehouse_id`"
+                      "name": "workspace_name",
+                      "expression": "`workspace_name`"
+                    },
+                    {
+                      "name": "warehouse_name",
+                      "expression": "`warehouse_name`"
+                    },
+                    {
+                      "name": "wh_config",
+                      "expression": "`wh_config`"
+                    },
+                    {
+                      "name": "recommended_action",
+                      "expression": "`recommended_action`"
+                    },
+                    {
+                      "name": "min_clusters",
+                      "expression": "`min_clusters`"
+                    },
+                    {
+                      "name": "max_clusters",
+                      "expression": "`max_clusters`"
+                    },
+                    {
+                      "name": "autoscaling",
+                      "expression": "`autoscaling`"
+                    },
+                    {
+                      "name": "recommended_max",
+                      "expression": "`recommended_max`"
                     },
                     {
                       "name": "clusters_to_add",
@@ -630,6 +608,10 @@
                     {
                       "name": "queue_days",
                       "expression": "`queue_days`"
+                    },
+                    {
+                      "name": "warehouse_id",
+                      "expression": "`warehouse_id`"
                     }
                   ],
                   "disaggregated": true
@@ -637,113 +619,208 @@
               }
             ],
             "spec": {
-              "version": 1,
+              "version": 2,
               "widgetType": "table",
               "encodings": {
                 "columns": [
                   {
-                    "fieldName": "warehouse_id",
-                    "displayName": "Warehouse ID",
-                    "booleanValues": [
-                      "false",
-                      "true"
-                    ],
-                    "type": "string",
-                    "displayAs": "string"
+                    "fieldName": "workspace_name",
+                    "displayName": "Workspace"
+                  },
+                  {
+                    "fieldName": "warehouse_name",
+                    "displayName": "Warehouse"
+                  },
+                  {
+                    "fieldName": "wh_config",
+                    "displayName": "Size / type"
+                  },
+                  {
+                    "fieldName": "recommended_action",
+                    "displayName": "Recommended action"
+                  },
+                  {
+                    "fieldName": "min_clusters",
+                    "displayName": "Min"
+                  },
+                  {
+                    "fieldName": "max_clusters",
+                    "displayName": "Max now"
+                  },
+                  {
+                    "fieldName": "autoscaling",
+                    "displayName": "Autoscaling"
+                  },
+                  {
+                    "fieldName": "recommended_max",
+                    "displayName": "Scale up to"
                   },
                   {
                     "fieldName": "clusters_to_add",
-                    "displayName": "Add clusters",
-                    "booleanValues": [
-                      "false",
-                      "true"
-                    ],
-                    "type": "string",
-                    "displayAs": "string"
+                    "displayName": "Add clusters"
                   },
                   {
                     "fieldName": "p95_depth",
-                    "displayName": "Peak-ish queued (p95)",
-                    "booleanValues": [
-                      "false",
-                      "true"
-                    ],
-                    "type": "string",
-                    "displayAs": "string"
+                    "displayName": "Queued at once (p95)"
                   },
                   {
                     "fieldName": "avg_queue_s",
-                    "displayName": "Avg wait (s)",
-                    "booleanValues": [
-                      "false",
-                      "true"
-                    ],
-                    "type": "string",
-                    "displayAs": "string"
+                    "displayName": "Avg wait (s)"
                   },
                   {
                     "fieldName": "p95_queue_s",
-                    "displayName": "p95 wait (s)",
-                    "booleanValues": [
-                      "false",
-                      "true"
-                    ],
-                    "type": "string",
-                    "displayAs": "string"
+                    "displayName": "p95 wait (s)"
                   },
                   {
                     "fieldName": "max_queue_min",
-                    "displayName": "Max wait (min)",
-                    "booleanValues": [
-                      "false",
-                      "true"
-                    ],
-                    "type": "string",
-                    "displayAs": "string"
+                    "displayName": "Max wait (min)"
                   },
                   {
                     "fieldName": "pct_queued",
-                    "displayName": "% queued",
-                    "booleanValues": [
-                      "false",
-                      "true"
-                    ],
-                    "type": "string",
-                    "displayAs": "string"
+                    "displayName": "% queued"
                   },
                   {
                     "fieldName": "queued_queries",
-                    "displayName": "Queued qrs (30d)",
-                    "booleanValues": [
-                      "false",
-                      "true"
-                    ],
-                    "type": "string",
-                    "displayAs": "string"
+                    "displayName": "Queued qrs (30d)"
                   },
                   {
                     "fieldName": "queue_days",
-                    "displayName": "Queue days",
-                    "booleanValues": [
-                      "false",
-                      "true"
-                    ],
-                    "type": "string",
-                    "displayAs": "string"
+                    "displayName": "Queue days"
+                  },
+                  {
+                    "fieldName": "warehouse_id",
+                    "displayName": "Warehouse ID"
                   }
                 ]
               },
+              "invisibleColumns": [],
               "frame": {
                 "showTitle": true,
-                "title": "All queuing warehouses (scale-up candidates)"
+                "title": "All warehouses to scale up (add clusters and/or size up)"
               }
             }
           },
           "position": {
             "x": 0,
-            "y": 2,
+            "y": 21,
             "width": 6,
             "height": 12
+          }
+        },
+        {
+          "widget": {
+            "name": "t_spill",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Warehouses to size up (disk spill)\n",
+                "Queries here **spilled to local disk** — they ran out of memory, so a **bigger warehouse** (more memory) is the fix, not more clusters. *Scale up to* suggests the next t-shirt size; heavy/large spill may warrant two sizes. Confirm against the warehouse monitoring page."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 33,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "tbl_spill",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "spill",
+                  "fields": [
+                    {
+                      "name": "workspace_name",
+                      "expression": "`workspace_name`"
+                    },
+                    {
+                      "name": "warehouse_name",
+                      "expression": "`warehouse_name`"
+                    },
+                    {
+                      "name": "warehouse_id",
+                      "expression": "`warehouse_id`"
+                    },
+                    {
+                      "name": "wh_config",
+                      "expression": "`wh_config`"
+                    },
+                    {
+                      "name": "recommended_size",
+                      "expression": "`recommended_size`"
+                    },
+                    {
+                      "name": "spill_queries",
+                      "expression": "`spill_queries`"
+                    },
+                    {
+                      "name": "pct_spill",
+                      "expression": "`pct_spill`"
+                    },
+                    {
+                      "name": "avg_spill_gb",
+                      "expression": "`avg_spill_gb`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "workspace_name",
+                    "displayName": "Workspace"
+                  },
+                  {
+                    "fieldName": "warehouse_name",
+                    "displayName": "Warehouse"
+                  },
+                  {
+                    "fieldName": "warehouse_id",
+                    "displayName": "Warehouse ID"
+                  },
+                  {
+                    "fieldName": "wh_config",
+                    "displayName": "Current size / type"
+                  },
+                  {
+                    "fieldName": "recommended_size",
+                    "displayName": "Scale up to"
+                  },
+                  {
+                    "fieldName": "spill_queries",
+                    "displayName": "Spilling queries"
+                  },
+                  {
+                    "fieldName": "pct_spill",
+                    "displayName": "% spill"
+                  },
+                  {
+                    "fieldName": "avg_spill_gb",
+                    "displayName": "Avg spill (GB)"
+                  }
+                ]
+              },
+              "invisibleColumns": [],
+              "frame": {
+                "showTitle": true,
+                "title": "Warehouses spilling to disk (size-up candidates)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 35,
+            "width": 6,
+            "height": 10
           }
         }
       ]
