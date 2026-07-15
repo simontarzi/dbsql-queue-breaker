@@ -51,5 +51,3 @@ databricks lakeview create \
 ## Notes & disclaimer
 - The `ceil(depth / 10)` (clusters) and `≥10% spill` (size‑up) thresholds are **heuristics** — a starting point. Sizing up helps memory‑bound / parallelizable work, not tiny or I/O‑bound queries. Treat every recommendation as a **candidate to confirm** in the SQL warehouse monitoring page before changing settings.
 - Provided **as‑is**, no warranty or official support. **Not an official Databricks product.**
-
-See [`docs/LABS.md`](docs/LABS.md) for the plan to submit this to [Databricks Labs](https://github.com/databrickslabs).
