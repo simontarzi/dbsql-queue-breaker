@@ -4,7 +4,24 @@
       "name": "warehouses",
       "displayName": "warehouses",
       "queryLines": [
-        "WITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id, workspace_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END,0.95)/1000.0,1) AS p95_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days,\n    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) AS spill_queries,\n    ROUND(AVG(CASE WHEN spilled_local_bytes>0 THEN spilled_local_bytes END)/1e9,2) AS avg_spill_gb\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id, workspace_id\n  HAVING queued_queries > 0 OR spill_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth, CAST(ROUND(approx_percentile(depth,0.95)) AS INT) AS p95_depth FROM run GROUP BY wid),\nwhcfg AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters FROM (\n    SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters,\n      ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n    FROM system.compute.warehouses WHERE delete_time IS NULL\n  ) WHERE rn=1\n),\nwsn AS (SELECT CAST(workspace_id AS STRING) wid, MAX(workspace_name) AS workspace_name\n        FROM system.access.workspaces_latest GROUP BY CAST(workspace_id AS STRING))\nSELECT a.warehouse_id, a.workspace_id, wsn.workspace_name, wc.warehouse_name,\n  concat_ws(' · ', initcap(lower(replace(wc.warehouse_size,'_',' '))), initcap(lower(wc.warehouse_type))) AS wh_config,\n  CASE\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 AND a.spill_queries*10 >= a.total_queries THEN 'Add clusters + size up'\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 THEN 'Add clusters'\n    WHEN a.spill_queries*10 >= a.total_queries THEN 'Size up'\n    ELSE 'Monitor'\n  END AS recommended_action,\n  CASE wc.warehouse_size\n    WHEN '2X_SMALL' THEN 'X-Small' WHEN 'X_SMALL' THEN 'Small' WHEN 'SMALL' THEN 'Medium'\n    WHEN 'MEDIUM' THEN 'Large' WHEN 'LARGE' THEN 'X-Large' WHEN 'X_LARGE' THEN '2X-Large'\n    WHEN '2X_LARGE' THEN '3X-Large' WHEN '3X_LARGE' THEN '4X-Large' WHEN '4X_LARGE' THEN '4X-Large (already max)'\n    ELSE NULL END AS recommended_size,\n  wc.min_clusters, wc.max_clusters,\n  CASE WHEN wc.max_clusters > wc.min_clusters THEN 'Yes' ELSE 'No' END AS autoscaling,\n  wc.max_clusters + CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS recommended_max,\n  CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS clusters_to_add,\n  a.spill_queries, ROUND(100.0*a.spill_queries/a.total_queries,1) AS pct_spill, COALESCE(a.avg_spill_gb,0) AS avg_spill_gb,\n  a.total_queries, a.queued_queries, a.pct_queued,\n  COALESCE(a.avg_queue_s,0) AS avg_queue_s, COALESCE(a.p95_queue_s,0) AS p95_queue_s,\n  COALESCE(a.max_queue_s,0) AS max_queue_s, ROUND(COALESCE(a.max_queue_s,0)/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.p95_depth,0) AS p95_depth,\n  CASE WHEN COALESCE(a.p95_queue_s,0)>=60 THEN 1 ELSE 0 END AS is_1min,\n  CASE WHEN COALESCE(a.p95_queue_s,0)<10 THEN '1. <10s' WHEN a.p95_queue_s<30 THEN '2. 10-30s'\n       WHEN a.p95_queue_s<60 THEN '3. 30-60s' WHEN a.p95_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a\nLEFT JOIN dep d ON d.wid = a.warehouse_id\nLEFT JOIN whcfg wc ON wc.warehouse_id = a.warehouse_id\nLEFT JOIN wsn ON wsn.wid = CAST(a.workspace_id AS STRING)"
+        "WITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id, workspace_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END, (CASE :pct WHEN 'Max' THEN 1.0 WHEN 'p95' THEN 0.95 WHEN 'p90' THEN 0.90 WHEN 'p75' THEN 0.75 WHEN 'p50' THEN 0.50 ELSE 0.95 END))/1000.0,1) AS pctl_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days,\n    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) AS spill_queries,\n    ROUND(AVG(CASE WHEN spilled_local_bytes>0 THEN spilled_local_bytes END)/1e9,2) AS avg_spill_gb\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id, workspace_id\n  HAVING queued_queries > 0 OR spill_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth,\n        CAST(ROUND(approx_percentile(depth, (CASE :pct WHEN 'Max' THEN 1.0 WHEN 'p95' THEN 0.95 WHEN 'p90' THEN 0.90 WHEN 'p75' THEN 0.75 WHEN 'p50' THEN 0.50 ELSE 0.95 END))) AS INT) AS pctl_depth FROM run GROUP BY wid),\nwhcfg AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters FROM (\n    SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters,\n      ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n    FROM system.compute.warehouses WHERE delete_time IS NULL\n  ) WHERE rn=1\n),\nwsn AS (SELECT CAST(workspace_id AS STRING) wid, MAX(workspace_name) AS workspace_name\n        FROM system.access.workspaces_latest GROUP BY CAST(workspace_id AS STRING))\nSELECT a.warehouse_id, a.workspace_id, wsn.workspace_name, wc.warehouse_name,\n  concat_ws(' · ', initcap(lower(replace(wc.warehouse_size,'_',' '))), initcap(lower(wc.warehouse_type))) AS wh_config,\n  CASE\n    WHEN CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) >= 1 AND a.spill_queries*10 >= a.total_queries THEN 'Add clusters + size up'\n    WHEN CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) >= 1 THEN 'Add clusters'\n    WHEN a.spill_queries*10 >= a.total_queries THEN 'Size up'\n    ELSE 'Monitor'\n  END AS recommended_action,\n  CASE wc.warehouse_size\n    WHEN '2X_SMALL' THEN 'X-Small' WHEN 'X_SMALL' THEN 'Small' WHEN 'SMALL' THEN 'Medium'\n    WHEN 'MEDIUM' THEN 'Large' WHEN 'LARGE' THEN 'X-Large' WHEN 'X_LARGE' THEN '2X-Large'\n    WHEN '2X_LARGE' THEN '3X-Large' WHEN '3X_LARGE' THEN '4X-Large' WHEN '4X_LARGE' THEN '4X-Large (already max)'\n    ELSE NULL END AS recommended_size,\n  wc.min_clusters, wc.max_clusters,\n  CASE WHEN wc.max_clusters > wc.min_clusters THEN 'Yes' ELSE 'No' END AS autoscaling,\n  wc.max_clusters + CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) AS recommended_max,\n  CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) AS clusters_to_add,\n  a.spill_queries, ROUND(100.0*a.spill_queries/a.total_queries,1) AS pct_spill, COALESCE(a.avg_spill_gb,0) AS avg_spill_gb,\n  a.total_queries, a.queued_queries, a.pct_queued,\n  COALESCE(a.avg_queue_s,0) AS avg_queue_s, COALESCE(a.pctl_queue_s,0) AS pctl_queue_s,\n  COALESCE(a.max_queue_s,0) AS max_queue_s, ROUND(COALESCE(a.max_queue_s,0)/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.pctl_depth,0) AS pctl_depth,\n  CASE WHEN COALESCE(a.pctl_queue_s,0)>=60 THEN 1 ELSE 0 END AS is_1min,\n  CASE WHEN COALESCE(a.pctl_queue_s,0)<10 THEN '1. <10s' WHEN a.pctl_queue_s<30 THEN '2. 10-30s'\n       WHEN a.pctl_queue_s<60 THEN '3. 30-60s' WHEN a.pctl_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a\nLEFT JOIN dep d ON d.wid = a.warehouse_id\nLEFT JOIN whcfg wc ON wc.warehouse_id = a.warehouse_id\nLEFT JOIN wsn ON wsn.wid = CAST(a.workspace_id AS STRING)"
+      ],
+      "parameters": [
+        {
+          "displayName": "Percentile",
+          "keyword": "pct",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "p95"
+                }
+              ]
+            }
+          }
+        }
       ]
     },
     {
@@ -18,11 +35,11 @@
       "name": "kpi",
       "displayName": "kpi",
       "queryLines": [
-        "SELECT SUM(CASE WHEN p95_queue_s >= CAST(:min_wait_sec AS DOUBLE) THEN 1 ELSE 0 END) AS wh_over,\n  SUM(clusters_to_add) AS clusters_to_add\nFROM (\nWITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id, workspace_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END,0.95)/1000.0,1) AS p95_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days,\n    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) AS spill_queries,\n    ROUND(AVG(CASE WHEN spilled_local_bytes>0 THEN spilled_local_bytes END)/1e9,2) AS avg_spill_gb\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id, workspace_id\n  HAVING queued_queries > 0 OR spill_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth, CAST(ROUND(approx_percentile(depth,0.95)) AS INT) AS p95_depth FROM run GROUP BY wid),\nwhcfg AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters FROM (\n    SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters,\n      ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n    FROM system.compute.warehouses WHERE delete_time IS NULL\n  ) WHERE rn=1\n),\nwsn AS (SELECT CAST(workspace_id AS STRING) wid, MAX(workspace_name) AS workspace_name\n        FROM system.access.workspaces_latest GROUP BY CAST(workspace_id AS STRING))\nSELECT a.warehouse_id, a.workspace_id, wsn.workspace_name, wc.warehouse_name,\n  concat_ws(' · ', initcap(lower(replace(wc.warehouse_size,'_',' '))), initcap(lower(wc.warehouse_type))) AS wh_config,\n  CASE\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 AND a.spill_queries*10 >= a.total_queries THEN 'Add clusters + size up'\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 THEN 'Add clusters'\n    WHEN a.spill_queries*10 >= a.total_queries THEN 'Size up'\n    ELSE 'Monitor'\n  END AS recommended_action,\n  CASE wc.warehouse_size\n    WHEN '2X_SMALL' THEN 'X-Small' WHEN 'X_SMALL' THEN 'Small' WHEN 'SMALL' THEN 'Medium'\n    WHEN 'MEDIUM' THEN 'Large' WHEN 'LARGE' THEN 'X-Large' WHEN 'X_LARGE' THEN '2X-Large'\n    WHEN '2X_LARGE' THEN '3X-Large' WHEN '3X_LARGE' THEN '4X-Large' WHEN '4X_LARGE' THEN '4X-Large (already max)'\n    ELSE NULL END AS recommended_size,\n  wc.min_clusters, wc.max_clusters,\n  CASE WHEN wc.max_clusters > wc.min_clusters THEN 'Yes' ELSE 'No' END AS autoscaling,\n  wc.max_clusters + CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS recommended_max,\n  CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS clusters_to_add,\n  a.spill_queries, ROUND(100.0*a.spill_queries/a.total_queries,1) AS pct_spill, COALESCE(a.avg_spill_gb,0) AS avg_spill_gb,\n  a.total_queries, a.queued_queries, a.pct_queued,\n  COALESCE(a.avg_queue_s,0) AS avg_queue_s, COALESCE(a.p95_queue_s,0) AS p95_queue_s,\n  COALESCE(a.max_queue_s,0) AS max_queue_s, ROUND(COALESCE(a.max_queue_s,0)/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.p95_depth,0) AS p95_depth,\n  CASE WHEN COALESCE(a.p95_queue_s,0)>=60 THEN 1 ELSE 0 END AS is_1min,\n  CASE WHEN COALESCE(a.p95_queue_s,0)<10 THEN '1. <10s' WHEN a.p95_queue_s<30 THEN '2. 10-30s'\n       WHEN a.p95_queue_s<60 THEN '3. 30-60s' WHEN a.p95_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a\nLEFT JOIN dep d ON d.wid = a.warehouse_id\nLEFT JOIN whcfg wc ON wc.warehouse_id = a.warehouse_id\nLEFT JOIN wsn ON wsn.wid = CAST(a.workspace_id AS STRING)\n)"
+        "SELECT SUM(CASE WHEN pctl_queue_s >= CAST(:min_wait_sec AS DOUBLE) THEN 1 ELSE 0 END) AS wh_over,\n  SUM(clusters_to_add) AS clusters_to_add\nFROM (\nWITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id, workspace_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END, (CASE :pct WHEN 'Max' THEN 1.0 WHEN 'p95' THEN 0.95 WHEN 'p90' THEN 0.90 WHEN 'p75' THEN 0.75 WHEN 'p50' THEN 0.50 ELSE 0.95 END))/1000.0,1) AS pctl_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days,\n    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) AS spill_queries,\n    ROUND(AVG(CASE WHEN spilled_local_bytes>0 THEN spilled_local_bytes END)/1e9,2) AS avg_spill_gb\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id, workspace_id\n  HAVING queued_queries > 0 OR spill_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth,\n        CAST(ROUND(approx_percentile(depth, (CASE :pct WHEN 'Max' THEN 1.0 WHEN 'p95' THEN 0.95 WHEN 'p90' THEN 0.90 WHEN 'p75' THEN 0.75 WHEN 'p50' THEN 0.50 ELSE 0.95 END))) AS INT) AS pctl_depth FROM run GROUP BY wid),\nwhcfg AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters FROM (\n    SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters,\n      ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n    FROM system.compute.warehouses WHERE delete_time IS NULL\n  ) WHERE rn=1\n),\nwsn AS (SELECT CAST(workspace_id AS STRING) wid, MAX(workspace_name) AS workspace_name\n        FROM system.access.workspaces_latest GROUP BY CAST(workspace_id AS STRING))\nSELECT a.warehouse_id, a.workspace_id, wsn.workspace_name, wc.warehouse_name,\n  concat_ws(' · ', initcap(lower(replace(wc.warehouse_size,'_',' '))), initcap(lower(wc.warehouse_type))) AS wh_config,\n  CASE\n    WHEN CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) >= 1 AND a.spill_queries*10 >= a.total_queries THEN 'Add clusters + size up'\n    WHEN CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) >= 1 THEN 'Add clusters'\n    WHEN a.spill_queries*10 >= a.total_queries THEN 'Size up'\n    ELSE 'Monitor'\n  END AS recommended_action,\n  CASE wc.warehouse_size\n    WHEN '2X_SMALL' THEN 'X-Small' WHEN 'X_SMALL' THEN 'Small' WHEN 'SMALL' THEN 'Medium'\n    WHEN 'MEDIUM' THEN 'Large' WHEN 'LARGE' THEN 'X-Large' WHEN 'X_LARGE' THEN '2X-Large'\n    WHEN '2X_LARGE' THEN '3X-Large' WHEN '3X_LARGE' THEN '4X-Large' WHEN '4X_LARGE' THEN '4X-Large (already max)'\n    ELSE NULL END AS recommended_size,\n  wc.min_clusters, wc.max_clusters,\n  CASE WHEN wc.max_clusters > wc.min_clusters THEN 'Yes' ELSE 'No' END AS autoscaling,\n  wc.max_clusters + CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) AS recommended_max,\n  CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) AS clusters_to_add,\n  a.spill_queries, ROUND(100.0*a.spill_queries/a.total_queries,1) AS pct_spill, COALESCE(a.avg_spill_gb,0) AS avg_spill_gb,\n  a.total_queries, a.queued_queries, a.pct_queued,\n  COALESCE(a.avg_queue_s,0) AS avg_queue_s, COALESCE(a.pctl_queue_s,0) AS pctl_queue_s,\n  COALESCE(a.max_queue_s,0) AS max_queue_s, ROUND(COALESCE(a.max_queue_s,0)/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.pctl_depth,0) AS pctl_depth,\n  CASE WHEN COALESCE(a.pctl_queue_s,0)>=60 THEN 1 ELSE 0 END AS is_1min,\n  CASE WHEN COALESCE(a.pctl_queue_s,0)<10 THEN '1. <10s' WHEN a.pctl_queue_s<30 THEN '2. 10-30s'\n       WHEN a.pctl_queue_s<60 THEN '3. 30-60s' WHEN a.pctl_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a\nLEFT JOIN dep d ON d.wid = a.warehouse_id\nLEFT JOIN whcfg wc ON wc.warehouse_id = a.warehouse_id\nLEFT JOIN wsn ON wsn.wid = CAST(a.workspace_id AS STRING)\n)"
       ],
       "parameters": [
         {
-          "displayName": "p95 wait threshold (sec)",
+          "displayName": "Queue-wait threshold (sec)",
           "keyword": "min_wait_sec",
           "dataType": "STRING",
           "defaultSelection": {
@@ -35,6 +52,21 @@
               ]
             }
           }
+        },
+        {
+          "displayName": "Percentile",
+          "keyword": "pct",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "p95"
+                }
+              ]
+            }
+          }
         }
       ]
     },
@@ -42,7 +74,31 @@
       "name": "spill",
       "displayName": "spill",
       "queryLines": [
-        "SELECT workspace_id, workspace_name, warehouse_id, warehouse_name, wh_config, recommended_size,\n  spill_queries, pct_spill, avg_spill_gb, total_queries\nFROM (\nWITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id, workspace_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END,0.95)/1000.0,1) AS p95_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days,\n    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) AS spill_queries,\n    ROUND(AVG(CASE WHEN spilled_local_bytes>0 THEN spilled_local_bytes END)/1e9,2) AS avg_spill_gb\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id, workspace_id\n  HAVING queued_queries > 0 OR spill_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth, CAST(ROUND(approx_percentile(depth,0.95)) AS INT) AS p95_depth FROM run GROUP BY wid),\nwhcfg AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters FROM (\n    SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters,\n      ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n    FROM system.compute.warehouses WHERE delete_time IS NULL\n  ) WHERE rn=1\n),\nwsn AS (SELECT CAST(workspace_id AS STRING) wid, MAX(workspace_name) AS workspace_name\n        FROM system.access.workspaces_latest GROUP BY CAST(workspace_id AS STRING))\nSELECT a.warehouse_id, a.workspace_id, wsn.workspace_name, wc.warehouse_name,\n  concat_ws(' · ', initcap(lower(replace(wc.warehouse_size,'_',' '))), initcap(lower(wc.warehouse_type))) AS wh_config,\n  CASE\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 AND a.spill_queries*10 >= a.total_queries THEN 'Add clusters + size up'\n    WHEN CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) >= 1 THEN 'Add clusters'\n    WHEN a.spill_queries*10 >= a.total_queries THEN 'Size up'\n    ELSE 'Monitor'\n  END AS recommended_action,\n  CASE wc.warehouse_size\n    WHEN '2X_SMALL' THEN 'X-Small' WHEN 'X_SMALL' THEN 'Small' WHEN 'SMALL' THEN 'Medium'\n    WHEN 'MEDIUM' THEN 'Large' WHEN 'LARGE' THEN 'X-Large' WHEN 'X_LARGE' THEN '2X-Large'\n    WHEN '2X_LARGE' THEN '3X-Large' WHEN '3X_LARGE' THEN '4X-Large' WHEN '4X_LARGE' THEN '4X-Large (already max)'\n    ELSE NULL END AS recommended_size,\n  wc.min_clusters, wc.max_clusters,\n  CASE WHEN wc.max_clusters > wc.min_clusters THEN 'Yes' ELSE 'No' END AS autoscaling,\n  wc.max_clusters + CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS recommended_max,\n  CAST(CEIL(COALESCE(d.p95_depth,0)/10.0) AS INT) AS clusters_to_add,\n  a.spill_queries, ROUND(100.0*a.spill_queries/a.total_queries,1) AS pct_spill, COALESCE(a.avg_spill_gb,0) AS avg_spill_gb,\n  a.total_queries, a.queued_queries, a.pct_queued,\n  COALESCE(a.avg_queue_s,0) AS avg_queue_s, COALESCE(a.p95_queue_s,0) AS p95_queue_s,\n  COALESCE(a.max_queue_s,0) AS max_queue_s, ROUND(COALESCE(a.max_queue_s,0)/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.p95_depth,0) AS p95_depth,\n  CASE WHEN COALESCE(a.p95_queue_s,0)>=60 THEN 1 ELSE 0 END AS is_1min,\n  CASE WHEN COALESCE(a.p95_queue_s,0)<10 THEN '1. <10s' WHEN a.p95_queue_s<30 THEN '2. 10-30s'\n       WHEN a.p95_queue_s<60 THEN '3. 30-60s' WHEN a.p95_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a\nLEFT JOIN dep d ON d.wid = a.warehouse_id\nLEFT JOIN whcfg wc ON wc.warehouse_id = a.warehouse_id\nLEFT JOIN wsn ON wsn.wid = CAST(a.workspace_id AS STRING)\n) WHERE spill_queries > 0"
+        "SELECT workspace_id, workspace_name, warehouse_id, warehouse_name, wh_config, recommended_size,\n  spill_queries, pct_spill, avg_spill_gb, total_queries\nFROM (\nWITH agg AS (\n  SELECT compute.warehouse_id AS warehouse_id, workspace_id,\n    COUNT(*) AS total_queries,\n    SUM(CASE WHEN waiting_at_capacity_duration_ms > 1000 THEN 1 ELSE 0 END) AS queued_queries,\n    ROUND(100.0*SUM(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_queued,\n    ROUND(AVG(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END)/1000.0,1) AS avg_queue_s,\n    ROUND(approx_percentile(CASE WHEN waiting_at_capacity_duration_ms>1000 THEN waiting_at_capacity_duration_ms END, (CASE :pct WHEN 'Max' THEN 1.0 WHEN 'p95' THEN 0.95 WHEN 'p90' THEN 0.90 WHEN 'p75' THEN 0.75 WHEN 'p50' THEN 0.50 ELSE 0.95 END))/1000.0,1) AS pctl_queue_s,\n    ROUND(MAX(waiting_at_capacity_duration_ms)/1000.0,1) AS max_queue_s,\n    COUNT(DISTINCT CASE WHEN waiting_at_capacity_duration_ms>1000 THEN date(start_time) END) AS queue_days,\n    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) AS spill_queries,\n    ROUND(AVG(CASE WHEN spilled_local_bytes>0 THEN spilled_local_bytes END)/1e9,2) AS avg_spill_gb\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND compute.warehouse_id IS NOT NULL\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n  GROUP BY compute.warehouse_id, workspace_id\n  HAVING queued_queries > 0 OR spill_queries > 0\n),\nq AS (\n  SELECT compute.warehouse_id AS wid, start_time AS a,\n    timestampadd(MILLISECOND, CAST(waiting_at_capacity_duration_ms AS INT), start_time) AS b\n  FROM system.query.history\n  WHERE compute.type='WAREHOUSE' AND waiting_at_capacity_duration_ms > 1000\n    AND start_time >= current_date() - INTERVAL 30 DAYS\n),\nev AS (SELECT wid, a AS ts, 1 AS d FROM q UNION ALL SELECT wid, b AS ts, -1 AS d FROM q),\nrun AS (SELECT wid, ts, SUM(d) OVER (PARTITION BY wid ORDER BY ts, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS depth FROM ev),\ndep AS (SELECT wid, MAX(depth) AS peak_depth,\n        CAST(ROUND(approx_percentile(depth, (CASE :pct WHEN 'Max' THEN 1.0 WHEN 'p95' THEN 0.95 WHEN 'p90' THEN 0.90 WHEN 'p75' THEN 0.75 WHEN 'p50' THEN 0.50 ELSE 0.95 END))) AS INT) AS pctl_depth FROM run GROUP BY wid),\nwhcfg AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters FROM (\n    SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type, min_clusters, max_clusters,\n      ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n    FROM system.compute.warehouses WHERE delete_time IS NULL\n  ) WHERE rn=1\n),\nwsn AS (SELECT CAST(workspace_id AS STRING) wid, MAX(workspace_name) AS workspace_name\n        FROM system.access.workspaces_latest GROUP BY CAST(workspace_id AS STRING))\nSELECT a.warehouse_id, a.workspace_id, wsn.workspace_name, wc.warehouse_name,\n  concat_ws(' · ', initcap(lower(replace(wc.warehouse_size,'_',' '))), initcap(lower(wc.warehouse_type))) AS wh_config,\n  CASE\n    WHEN CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) >= 1 AND a.spill_queries*10 >= a.total_queries THEN 'Add clusters + size up'\n    WHEN CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) >= 1 THEN 'Add clusters'\n    WHEN a.spill_queries*10 >= a.total_queries THEN 'Size up'\n    ELSE 'Monitor'\n  END AS recommended_action,\n  CASE wc.warehouse_size\n    WHEN '2X_SMALL' THEN 'X-Small' WHEN 'X_SMALL' THEN 'Small' WHEN 'SMALL' THEN 'Medium'\n    WHEN 'MEDIUM' THEN 'Large' WHEN 'LARGE' THEN 'X-Large' WHEN 'X_LARGE' THEN '2X-Large'\n    WHEN '2X_LARGE' THEN '3X-Large' WHEN '3X_LARGE' THEN '4X-Large' WHEN '4X_LARGE' THEN '4X-Large (already max)'\n    ELSE NULL END AS recommended_size,\n  wc.min_clusters, wc.max_clusters,\n  CASE WHEN wc.max_clusters > wc.min_clusters THEN 'Yes' ELSE 'No' END AS autoscaling,\n  wc.max_clusters + CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) AS recommended_max,\n  CAST(CEIL(COALESCE(d.pctl_depth,0)/10.0) AS INT) AS clusters_to_add,\n  a.spill_queries, ROUND(100.0*a.spill_queries/a.total_queries,1) AS pct_spill, COALESCE(a.avg_spill_gb,0) AS avg_spill_gb,\n  a.total_queries, a.queued_queries, a.pct_queued,\n  COALESCE(a.avg_queue_s,0) AS avg_queue_s, COALESCE(a.pctl_queue_s,0) AS pctl_queue_s,\n  COALESCE(a.max_queue_s,0) AS max_queue_s, ROUND(COALESCE(a.max_queue_s,0)/60.0,1) AS max_queue_min, a.queue_days,\n  COALESCE(d.peak_depth,0) AS peak_depth, COALESCE(d.pctl_depth,0) AS pctl_depth,\n  CASE WHEN COALESCE(a.pctl_queue_s,0)>=60 THEN 1 ELSE 0 END AS is_1min,\n  CASE WHEN COALESCE(a.pctl_queue_s,0)<10 THEN '1. <10s' WHEN a.pctl_queue_s<30 THEN '2. 10-30s'\n       WHEN a.pctl_queue_s<60 THEN '3. 30-60s' WHEN a.pctl_queue_s<300 THEN '4. 1-5min'\n       ELSE '5. 5min+' END AS wait_bucket\nFROM agg a\nLEFT JOIN dep d ON d.wid = a.warehouse_id\nLEFT JOIN whcfg wc ON wc.warehouse_id = a.warehouse_id\nLEFT JOIN wsn ON wsn.wid = CAST(a.workspace_id AS STRING)\n) WHERE spill_queries > 0"
+      ],
+      "parameters": [
+        {
+          "displayName": "Percentile",
+          "keyword": "pct",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "p95"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "pctopts",
+      "displayName": "pctopts",
+      "queryLines": [
+        "SELECT col1 AS label FROM VALUES ('Max'),('p95'),('p90'),('p75'),('p50')"
       ]
     }
   ],
@@ -57,7 +113,7 @@
             "multilineTextboxSpec": {
               "lines": [
                 "# 📊 DBSQL Queue Breaker — are your SQL warehouses making users wait?\n",
-                "Reads your workspace's `system.query.history` and finds warehouses that need more headroom, and **which lever** to pull: **Add clusters** (queries queuing at capacity → raise max clusters) or **Size up** (queries spilling to disk → bigger t-shirt size). The **table** gives a per-warehouse recommended action. Filter by **Workspace**. _Trailing 30 days · read-only · nothing leaves your workspace._"
+                "Reads your workspace's `system.query.history` and finds warehouses that need more headroom, and **which lever** to pull: **Add clusters** (queries queuing at capacity → raise max clusters) or **Size up** (queries spilling to disk → bigger t-shirt size). The **table** gives a per-warehouse recommended action. Filter by **Workspace**, and choose the **percentile** the whole dashboard uses. _Trailing 30 days · read-only · nothing leaves your workspace._"
               ]
             }
           },
@@ -131,6 +187,116 @@
         },
         {
           "widget": {
+            "name": "f_pct",
+            "queries": [
+              {
+                "name": "f_pct_opts",
+                "query": {
+                  "datasetName": "pctopts",
+                  "fields": [
+                    {
+                      "name": "label",
+                      "expression": "`label`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_pct_warehouses",
+                "query": {
+                  "datasetName": "warehouses",
+                  "parameters": [
+                    {
+                      "name": "pct",
+                      "keyword": "pct"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_pct_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "parameters": [
+                    {
+                      "name": "pct",
+                      "keyword": "pct"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_pct_spill",
+                "query": {
+                  "datasetName": "spill",
+                  "parameters": [
+                    {
+                      "name": "pct",
+                      "keyword": "pct"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "label",
+                    "displayName": "Percentile",
+                    "queryName": "f_pct_opts"
+                  },
+                  {
+                    "parameterName": "pct",
+                    "queryName": "f_pct_warehouses"
+                  },
+                  {
+                    "parameterName": "pct",
+                    "queryName": "f_pct_kpi"
+                  },
+                  {
+                    "parameterName": "pct",
+                    "queryName": "f_pct_spill"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Percentile (recommendation basis)"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "t_pctmsg",
+            "multilineTextboxSpec": {
+              "lines": [
+                "**Percentile drives the recommendation.** *Max* = size for the worst spike ever seen (most aggressive). *p95* (default) = ignore the top 5% of spikes. *p50* = size for the typical moment (most conservative). Changing it recomputes clusters-to-add, the KPI, buckets, scatter and both tables."
+              ]
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
             "name": "k_over",
             "queries": [
               {
@@ -154,12 +320,12 @@
                 "value": {
                   "fieldName": "wh_over",
                   "aggregation": "SUM",
-                  "displayName": "Warehouses over p95 threshold"
+                  "displayName": "Warehouses over wait threshold"
                 }
               },
               "frame": {
                 "showTitle": true,
-                "title": "Warehouses over p95 threshold"
+                "title": "Warehouses over wait threshold"
               }
             }
           },
@@ -201,7 +367,7 @@
               },
               "frame": {
                 "showTitle": true,
-                "title": "p95 wait threshold (sec)"
+                "title": "Queue-wait threshold (sec)"
               }
             }
           },
@@ -217,7 +383,7 @@
             "name": "t_setmsg",
             "multilineTextboxSpec": {
               "lines": [
-                "**⚠️ Please set the p95 wait threshold (seconds)** in the box to the left — the *Warehouses over p95 threshold* count = warehouses whose p95 queue wait is ≥ that many seconds."
+                "**⚠️ Set the queue-wait threshold (seconds)** to the left — the *Warehouses over wait threshold* count = warehouses whose queue wait **at the selected percentile** is ≥ that many seconds."
               ]
             }
           },
@@ -329,7 +495,7 @@
                       "by": "natural-order"
                     }
                   },
-                  "displayName": "p95 wait"
+                  "displayName": "wait"
                 },
                 "y": {
                   "fieldName": "cnt",
@@ -344,7 +510,7 @@
               },
               "frame": {
                 "showTitle": true,
-                "title": "Warehouses by wait severity (p95)"
+                "title": "Warehouses by wait severity (selected pct)"
               },
               "mark": {
                 "colors": [
@@ -451,8 +617,8 @@
                   "datasetName": "warehouses",
                   "fields": [
                     {
-                      "name": "p95_queue_s",
-                      "expression": "`p95_queue_s`"
+                      "name": "pctl_queue_s",
+                      "expression": "`pctl_queue_s`"
                     },
                     {
                       "name": "clusters_to_add",
@@ -472,11 +638,11 @@
               "widgetType": "scatter",
               "encodings": {
                 "x": {
-                  "fieldName": "p95_queue_s",
+                  "fieldName": "pctl_queue_s",
                   "scale": {
                     "type": "quantitative"
                   },
-                  "displayName": "p95 queue wait (s)"
+                  "displayName": "Queue wait at selected pct (s)"
                 },
                 "y": {
                   "fieldName": "clusters_to_add",
@@ -525,7 +691,7 @@
             "multilineTextboxSpec": {
               "lines": [
                 "## Warehouses to scale up\n",
-                "**Recommended action** — *Add clusters* = queries queue at capacity (raise the max scaling limit, ≈1 cluster per 10 concurrently-queued queries). *Size up* = queries spill to disk (out of memory → bump the t-shirt size). *Add clusters + size up* = both. Spill/queue thresholds are heuristics — confirm in the warehouse monitoring page before changing settings. Warehouse shown by **ID** (find it under SQL Warehouses)."
+                "**Recommended action** — *Add clusters* = queries queue at capacity (raise the max scaling limit, ≈1 cluster per 10 concurrently-queued queries **at the selected percentile**). *Size up* = queries spill to disk (out of memory → bump the t-shirt size). *Add clusters + size up* = both. Thresholds are heuristics — confirm in the warehouse monitoring page. Warehouse shown by **ID** (find it under SQL Warehouses)."
               ]
             }
           },
@@ -582,16 +748,20 @@
                       "expression": "`clusters_to_add`"
                     },
                     {
-                      "name": "p95_depth",
-                      "expression": "`p95_depth`"
+                      "name": "pctl_depth",
+                      "expression": "`pctl_depth`"
+                    },
+                    {
+                      "name": "peak_depth",
+                      "expression": "`peak_depth`"
                     },
                     {
                       "name": "avg_queue_s",
                       "expression": "`avg_queue_s`"
                     },
                     {
-                      "name": "p95_queue_s",
-                      "expression": "`p95_queue_s`"
+                      "name": "pctl_queue_s",
+                      "expression": "`pctl_queue_s`"
                     },
                     {
                       "name": "max_queue_min",
@@ -660,16 +830,20 @@
                     "displayName": "Add clusters"
                   },
                   {
-                    "fieldName": "p95_depth",
-                    "displayName": "Queued at once (p95)"
+                    "fieldName": "pctl_depth",
+                    "displayName": "Queued at once (sel. pct)"
+                  },
+                  {
+                    "fieldName": "peak_depth",
+                    "displayName": "Queued at once (max)"
                   },
                   {
                     "fieldName": "avg_queue_s",
                     "displayName": "Avg wait (s)"
                   },
                   {
-                    "fieldName": "p95_queue_s",
-                    "displayName": "p95 wait (s)"
+                    "fieldName": "pctl_queue_s",
+                    "displayName": "Wait at sel. pct (s)"
                   },
                   {
                     "fieldName": "max_queue_min",

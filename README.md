@@ -11,17 +11,18 @@ Both are silent problems today — nothing in the product flags them — and bot
 
 ## What you get (single page)
 
-- **KPI + knob:** "Warehouses over p95 threshold" with an adjustable **`p95 wait threshold (sec)`** parameter — set it to 60, 300, 30… and the count updates.
+- **Percentile selector:** a dashboard‑wide **Percentile (recommendation basis)** dropdown — **Max · p95 · p90 · p75 · p50** (default p95). It drives the *entire* dashboard: change it and the clusters‑to‑add, KPI, wait buckets, scatter, and both tables all recompute. *Max* sizes for the worst spike ever seen (most aggressive); *p95* ignores the top 5% of spikes; *p50* sizes for the typical moment (most conservative).
+- **KPI + knob:** "Warehouses over wait threshold" with an adjustable **`Queue-wait threshold (sec)`** parameter — set it to 60, 300, 30… and the count updates (it compares each warehouse's queue wait **at the selected percentile**).
 - **Queued queries per day** — daily total trend.
-- **Warehouses by wait severity (p95)** and **Warehouses by recommended action** bar charts.
-- **Where to act** scatter — p95 wait vs. clusters‑to‑add, colored by recommended action.
-- **Table 1 — "All warehouses to scale up (add clusters …)":** Workspace · Warehouse · Size/type · **Recommended action** · Min · Max now · Autoscaling · **Scale up to** (clusters) · **+Clusters** · queue metrics.
+- **Warehouses by wait severity (selected percentile)** and **Warehouses by recommended action** bar charts.
+- **Where to act** scatter — queue wait (at the selected percentile) vs. clusters‑to‑add, colored by recommended action.
+- **Table 1 — "All warehouses to scale up (add clusters …)":** Workspace · Warehouse · Size/type · **Recommended action** · Min · Max now · Autoscaling · **Scale up to** (clusters) · **+Clusters** · queued‑at‑once (selected pct **and** max) · queue metrics.
 - **Table 2 — "Warehouses spilling to disk (size‑up candidates)":** Workspace · Warehouse · Current size/type · **Scale up to** (next t‑shirt size) · Spilling queries · % spill · Avg spill (GB).
-- **Workspace filter** across the whole dashboard.
+- **Workspace filter** and the **percentile selector** apply across the whole dashboard.
 
 ## How the recommendations work
 - **Queue signal:** `waiting_at_capacity_duration_ms` (queued because the warehouse was at capacity). Deliberately **excludes** `waiting_for_compute_duration_ms` (transient scale‑up latency) so you only see genuine under‑provisioning.
-- **Add clusters:** a concurrent‑queue‑depth sweep → **`clusters_to_add = ceil(p95_concurrent_queued / 10)`** (~10 queries per cluster for classic routing), added to the configured `max_clusters`.
+- **Add clusters:** a concurrent‑queue‑depth sweep → **`clusters_to_add = ceil(depth_at_selected_pct / 10)`** (~10 queries per cluster for classic routing; the percentile is the dashboard‑wide selector, default p95), added to the configured `max_clusters`.
 - **Size up:** **`spilled_local_bytes > 0`** — the signal Databricks' own warehouse‑sizing docs use ("excessive spill indicates the warehouse size is too small"). A warehouse where ≥10% of queries spill is flagged **Size up**, with the next t‑shirt size suggested.
 - **Window:** trailing 30 days.
 
@@ -50,4 +51,5 @@ databricks lakeview create \
 
 ## Notes & disclaimer
 - The `ceil(depth / 10)` (clusters) and `≥10% spill` (size‑up) thresholds are **heuristics** — a starting point. Sizing up helps memory‑bound / parallelizable work, not tiny or I/O‑bound queries. Treat every recommendation as a **candidate to confirm** in the SQL warehouse monitoring page before changing settings.
+- Use the **percentile selector** to sanity‑check how sensitive a recommendation is: if a warehouse only needs clusters at *Max* but not at *p95*, it's a rare‑spike problem, not sustained under‑provisioning.
 - Provided **as‑is**, no warranty or official support. **Not an official Databricks product.**
